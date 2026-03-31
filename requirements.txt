@@ -1,0 +1,8 @@
+aiohttp
+aiosqlite
+beautifulsoup4
+lxml
+python-telegram-bot[job-queue]
+fastapi
+uvicorn
+pytz
