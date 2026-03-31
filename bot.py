@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Meme Coin Trend Analyzer Bot - Fully Asynchronous with FastAPI & Gemini LLM
-Optimized for Railway deployment with real-time trend detection.
+Uses multiple free trend sources + caching to stay within free limits.
 """
 
 import os
@@ -19,6 +19,7 @@ from io import BytesIO
 import aiohttp
 import aiosqlite
 import pytz
+from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
@@ -56,9 +57,21 @@ ERROR_CHAT_ID = os.getenv("TELEGRAM_ERROR_CHAT_ID", DEFAULT_CHAT_ID)
 DB_PATH = "trends.db"
 
 # Daily summary settings
-DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", "8"))  # 8 AM
+DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", "8"))
 DAILY_SUMMARY_MINUTE = int(os.getenv("DAILY_SUMMARY_MINUTE", "0"))
-DAILY_SUMMARY_TIMEZONE = os.getenv("DAILY_SUMMARY_TIMEZONE", "Asia/Kolkata")  # IST
+DAILY_SUMMARY_TIMEZONE = os.getenv("DAILY_SUMMARY_TIMEZONE", "Asia/Kolkata")
+
+# Performance & caching
+MAX_TOPICS = int(os.getenv("MAX_TOPICS", "5"))                     # topics processed per cycle
+TWITTER_COUNTS_CACHE_TTL = int(os.getenv("TWITTER_COUNTS_CACHE_TTL", "3600"))  # seconds
+MEMEABILITY_CACHE_TTL = int(os.getenv("MEMEABILITY_CACHE_TTL", "21600"))       # 6 hours
+
+# Trend sources (free, no API keys)
+TREND_SOURCES = [
+    "https://getdaytrends.com/",
+    "https://trends24.in/",
+    "https://toptrendsnow.com/",
+]
 
 # Logging
 logging.basicConfig(
@@ -67,7 +80,118 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# -------------------------- Helper Functions --------------------------
+def round_datetime(dt: datetime, minutes: int) -> datetime:
+    """Round datetime down to the nearest multiple of `minutes`."""
+    epoch = dt.timestamp()
+    rounded = epoch - (epoch % (minutes * 60))
+    return datetime.fromtimestamp(rounded)
+
+
+def normalize_topic(topic: str) -> str:
+    cleaned = re.sub(r'[^a-z0-9\s]', '', topic.lower())
+    return cleaned.strip()
+
+
+def extract_json_from_response(response: str) -> Optional[Dict]:
+    start = response.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    end = -1
+    for i in range(start, len(response)):
+        if response[i] == '{':
+            depth += 1
+        elif response[i] == '}':
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end == -1:
+        return None
+    json_str = response[start:end+1]
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        return None
+
+
+# -------------------------- Async API Helpers --------------------------
+class RateLimiter:
+    def __init__(self, rate_limit: int, period: float):
+        self.rate_limit = rate_limit
+        self.period = period
+        self.tokens = rate_limit
+        self.last_refill = asyncio.get_event_loop().time()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self._lock:
+            while self.tokens <= 0:
+                now = asyncio.get_event_loop().time()
+                elapsed = now - self.last_refill
+                if elapsed >= self.period:
+                    self.tokens = self.rate_limit
+                    self.last_refill = now
+                else:
+                    await asyncio.sleep(self.period - elapsed)
+            self.tokens -= 1
+
+
+async def fetch_json(session: aiohttp.ClientSession, url: str, params: Optional[Dict] = None, headers: Optional[Dict] = None, json_data: Optional[Dict] = None, timeout: int = 30) -> Optional[Dict]:
+    retries = 3
+    for attempt in range(retries):
+        try:
+            async with session.request(
+                "POST" if json_data else "GET",
+                url,
+                params=params,
+                headers=headers,
+                json=json_data,
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                elif resp.status == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 5))
+                    await asyncio.sleep(retry_after)
+                    continue
+                else:
+                    logger.warning(f"HTTP {resp.status} for {url}")
+                    return None
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout fetching {url} (attempt {attempt+1})")
+            await asyncio.sleep(2 ** attempt)
+        except aiohttp.ClientError as e:
+            logger.error(f"Request error: {e}")
+            await asyncio.sleep(2 ** attempt)
+    return None
+
+
+class TTLCache:
+    def __init__(self, ttl_seconds=3600):
+        self.ttl = ttl_seconds
+        self._cache = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, key):
+        async with self._lock:
+            entry = self._cache.get(key)
+            if entry and entry['expires'] > datetime.now():
+                return entry['value']
+            return None
+
+    async def set(self, key, value):
+        async with self._lock:
+            self._cache[key] = {
+                'value': value,
+                'expires': datetime.now() + timedelta(seconds=self.ttl)
+            }
+
+
 # -------------------------- Database Layer (Async) --------------------------
+# (unchanged, keep as before)
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -103,7 +227,6 @@ async def init_db():
                 threshold INTEGER DEFAULT 75
             )
         """)
-        # Table for mention counts – now populated
         await db.execute("""
             CREATE TABLE IF NOT EXISTS topic_mentions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,11 +238,13 @@ async def init_db():
         """)
         await db.commit()
 
+
 async def get_user_threshold(chat_id: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT threshold FROM user_settings WHERE chat_id = ?", (chat_id,))
         row = await cursor.fetchone()
         return row[0] if row else PUMP_SCORE_THRESHOLD
+
 
 async def set_user_threshold(chat_id: int, threshold: int):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -128,6 +253,7 @@ async def set_user_threshold(chat_id: int, threshold: int):
             (chat_id, threshold)
         )
         await db.commit()
+
 
 async def save_topic(topic: str, scores: Dict, generated: Optional[Dict] = None, alert: bool = False):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -160,6 +286,7 @@ async def save_topic(topic: str, scores: Dict, generated: Optional[Dict] = None,
         await db.commit()
         return topic_id
 
+
 async def get_recent_alert_score(topic: str, hours: int = COOLDOWN_HOURS) -> Optional[float]:
     cutoff = datetime.now() - timedelta(hours=hours)
     async with aiosqlite.connect(DB_PATH) as db:
@@ -172,6 +299,7 @@ async def get_recent_alert_score(topic: str, hours: int = COOLDOWN_HOURS) -> Opt
         row = await cursor.fetchone()
         return row[0] if row else None
 
+
 async def save_mentions(topic: str, source: str, count: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -179,6 +307,7 @@ async def save_mentions(topic: str, source: str, count: int):
             (topic, source, count)
         )
         await db.commit()
+
 
 async def get_mention_counts(topic: str, source: str, minutes: int) -> int:
     cutoff = datetime.now() - timedelta(minutes=minutes)
@@ -190,6 +319,7 @@ async def get_mention_counts(topic: str, source: str, minutes: int) -> int:
         row = await cursor.fetchone()
         return row[0] if row[0] else 0
 
+
 async def get_latest_scores(limit=50) -> List[Tuple]:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
@@ -200,8 +330,8 @@ async def get_latest_scores(limit=50) -> List[Tuple]:
         """, (limit,))
         return await cursor.fetchall()
 
+
 async def get_topics_last_24h(limit=20) -> List[Tuple]:
-    """Get topics from last 24 hours for daily summary."""
     cutoff = datetime.now() - timedelta(hours=24)
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
@@ -213,82 +343,6 @@ async def get_topics_last_24h(limit=20) -> List[Tuple]:
         """, (cutoff, limit))
         return await cursor.fetchall()
 
-# -------------------------- Helper Functions --------------------------
-def normalize_topic(topic: str) -> str:
-    cleaned = re.sub(r'[^a-z0-9\s]', '', topic.lower())
-    return cleaned.strip()
-
-def extract_json_from_response(response: str) -> Optional[Dict]:
-    start = response.find('{')
-    if start == -1:
-        return None
-    depth = 0
-    end = -1
-    for i in range(start, len(response)):
-        if response[i] == '{':
-            depth += 1
-        elif response[i] == '}':
-            depth -= 1
-            if depth == 0:
-                end = i
-                break
-    if end == -1:
-        return None
-    json_str = response[start:end+1]
-    try:
-        return json.loads(json_str)
-    except json.JSONDecodeError:
-        return None
-
-# -------------------------- Async API Helpers --------------------------
-class RateLimiter:
-    def __init__(self, rate_limit: int, period: float):
-        self.rate_limit = rate_limit
-        self.period = period
-        self.tokens = rate_limit
-        self.last_refill = asyncio.get_event_loop().time()
-        self._lock = asyncio.Lock()
-
-    async def acquire(self):
-        async with self._lock:
-            while self.tokens <= 0:
-                now = asyncio.get_event_loop().time()
-                elapsed = now - self.last_refill
-                if elapsed >= self.period:
-                    self.tokens = self.rate_limit
-                    self.last_refill = now
-                else:
-                    await asyncio.sleep(self.period - elapsed)
-            self.tokens -= 1
-
-async def fetch_json(session: aiohttp.ClientSession, url: str, params: Optional[Dict] = None, headers: Optional[Dict] = None, json_data: Optional[Dict] = None, timeout: int = 30) -> Optional[Dict]:
-    retries = 3
-    for attempt in range(retries):
-        try:
-            async with session.request(
-                "POST" if json_data else "GET",
-                url,
-                params=params,
-                headers=headers,
-                json=json_data,
-                timeout=aiohttp.ClientTimeout(total=timeout)
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                elif resp.status == 429:
-                    retry_after = int(resp.headers.get("Retry-After", 5))
-                    await asyncio.sleep(retry_after)
-                    continue
-                else:
-                    logger.warning(f"HTTP {resp.status} for {url}")
-                    return None
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout fetching {url} (attempt {attempt+1})")
-            await asyncio.sleep(2 ** attempt)
-        except aiohttp.ClientError as e:
-            logger.error(f"Request error: {e}")
-            await asyncio.sleep(2 ** attempt)
-    return None
 
 # -------------------------- Data Collector (Async) --------------------------
 class AsyncDataCollector:
@@ -304,6 +358,8 @@ class AsyncDataCollector:
         self._reddit_token = None
         self._reddit_token_expiry = None
         self._reddit_token_lock = asyncio.Lock()
+        self.count_cache = TTLCache(ttl_seconds=TWITTER_COUNTS_CACHE_TTL)
+        self.memeability_cache = TTLCache(ttl_seconds=MEMEABILITY_CACHE_TTL)
 
     async def _get_reddit_oauth_token(self, session: aiohttp.ClientSession) -> Optional[str]:
         async with self._reddit_token_lock:
@@ -328,59 +384,68 @@ class AsyncDataCollector:
             return None
 
     async def get_twitter_trending(self, session: aiohttp.ClientSession) -> List[str]:
-        if not self.twitter_bearer:
-            return []
+        """Try multiple free trend sources until one works."""
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        for source in TREND_SOURCES:
+            try:
+                async with session.get(source, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        continue
+                    html = await resp.text()
+                    soup = BeautifulSoup(html, 'lxml')
+                    # Try to find a table with trends
+                    table = soup.find('table')
+                    if not table:
+                        continue
+                    trends = []
+                    rows = table.find_all('tr')
+                    for row in rows[1:11]:  # top 10
+                        cells = row.find_all('td')
+                        if len(cells) >= 2:
+                            topic = cells[1].get_text(strip=True)
+                            if topic:
+                                trends.append(topic)
+                    if trends:
+                        logger.info(f"Fetched {len(trends)} trends from {source}")
+                        await asyncio.sleep(1)  # be polite
+                        return trends
+            except Exception as e:
+                logger.warning(f"Failed to fetch trends from {source}: {e}")
+        logger.warning("All trend sources failed, using hardcoded keywords")
+        return self._fallback_trending()
 
-        await self.twitter_rate_limiter.acquire()
-        url = "https://api.twitter.com/2/trends/place"
-        params = {"id": "1"}
-        headers = {"Authorization": f"Bearer {self.twitter_bearer}"}
-        data = await fetch_json(session, url, params=params, headers=headers, timeout=10)
-        if data and "trends" in data and data["trends"]:
-            return [trend["name"] for trend in data["trends"][:10]]
-
-        logger.info("Trends endpoint unavailable, falling back to search-based trending")
-        query = "-is:retweet lang:en"
-        url = "https://api.twitter.com/2/tweets/search/recent"
-        params = {
-            "query": query,
-            "max_results": 100,
-            "tweet.fields": "public_metrics",
-            # sort_order removed
-        }
-        data = await fetch_json(session, url, params=params, headers=headers, timeout=15)
-        if data and "data" in data:
-            topics = []
-            for tweet in data["data"]:
-                text = tweet.get("text", "")
-                words = text.split()[:5]
-                topic = " ".join(words).strip()
-                if topic and len(topic) > 3:
-                    topics.append(topic)
-            return list(set(topics))[:10]
-
-        logger.warning("Twitter trending fallback failed, using hardcoded keywords")
+    def _fallback_trending(self) -> List[str]:
+        logger.info("Using fallback hardcoded trending keywords")
         return ["solana", "memecoin", "bitcoin", "ethereum", "nft", "ai", "degen", "pumpfun"]
 
     async def search_tweets(self, session: aiohttp.ClientSession, query: str, start_time: datetime, end_time: datetime) -> int:
         if not self.twitter_bearer:
             return 0
+        # Round time windows to improve cache hits
+        rounded_start = round_datetime(start_time, 60)   # hour rounding
+        rounded_end = round_datetime(end_time, 60)
+        key = f"{query}|{rounded_start.isoformat()}|{rounded_end.isoformat()}"
+        cached = await self.count_cache.get(key)
+        if cached is not None:
+            logger.debug(f"Cache hit for {key}")
+            return cached
+
         await self.twitter_rate_limiter.acquire()
         url = "https://api.twitter.com/2/tweets/counts/recent"
         params = {
             "query": f"{query} lang:en -is:retweet",
-            "start_time": start_time.isoformat(timespec="seconds") + "Z",
-            "end_time": end_time.isoformat(timespec="seconds") + "Z",
+            "start_time": rounded_start.isoformat(timespec="seconds") + "Z",
+            "end_time": rounded_end.isoformat(timespec="seconds") + "Z",
             "granularity": "minute"
         }
         headers = {"Authorization": f"Bearer {self.twitter_bearer}"}
         data = await fetch_json(session, url, params=params, headers=headers, timeout=10)
+        count = 0
         if data and "data" in data:
-            total = sum(entry["tweet_count"] for entry in data["data"])
-            # Save mention counts for history
-            await save_mentions(query, "twitter", total)
-            return total
-        return 0
+            count = sum(entry["tweet_count"] for entry in data["data"])
+            await save_mentions(query, "twitter", count)
+        await self.count_cache.set(key, count)
+        return count
 
     async def get_reddit_posts(self, session: aiohttp.ClientSession, subreddits: List[str], limit: int = 10) -> List[Dict]:
         await self.reddit_rate_limiter.acquire()
@@ -403,14 +468,12 @@ class AsyncDataCollector:
                         "created_utc": post["created_utc"],
                         "subreddit": sub
                     })
-                    # Save mention counts (each post counts as one mention of its title)
                     await save_mentions(normalize_topic(post["title"]), "reddit", 1)
             await asyncio.sleep(0.5)
         return posts
 
     async def get_dexscreener_pairs(self, session: aiohttp.ClientSession, query: str, chain: str = "solana") -> List[Dict]:
         await self.dexscreener_rate_limiter.acquire()
-        # Improved query: if topic looks like a ticker (short, all caps) or known crypto ticker
         known_tickers = {"BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "WIF", "BONK"}
         if (query.isupper() and len(query) <= 5) or query.upper() in known_tickers:
             search_query = f"${query}"
@@ -437,8 +500,8 @@ class AsyncDataCollector:
                 filtered.append(pair)
         return filtered
 
+
 # -------------------------- LLM Integration (Async) --------------------------
-# Base class for all LLM providers
 class BaseLLM:
     async def ask(self, session: aiohttp.ClientSession, prompt: str, system: str = None, timeout: int = 30) -> str:
         raise NotImplementedError
@@ -492,6 +555,7 @@ Return as JSON:
             "logo_prompt": f"Cartoon {topic} character with crypto elements"
         }
 
+
 class GeminiLLM(BaseLLM):
     def __init__(self, api_key: str, model: str = "gemini-1.5-flash"):
         self.api_key = api_key
@@ -500,13 +564,11 @@ class GeminiLLM(BaseLLM):
 
     async def ask(self, session: aiohttp.ClientSession, prompt: str, system: str = None, timeout: int = 30) -> str:
         await self.rate_limiter.acquire()
-        # Gemini API uses POST to https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
         payload = {
             "contents": [{"parts": [{"text": prompt}]}]
         }
         if system:
-            # Gemini doesn't have system prompt; we can prepend it to the user prompt.
             payload["contents"][0]["parts"][0]["text"] = f"{system}\n\n{prompt}"
         headers = {"Content-Type": "application/json"}
         data = await fetch_json(session, url, json_data=payload, headers=headers, timeout=timeout)
@@ -515,6 +577,7 @@ class GeminiLLM(BaseLLM):
         else:
             logger.error(f"Gemini error: {data}")
             return ""
+
 
 class OpenAIChatLLM(BaseLLM):
     def __init__(self, api_key: str, base_url: str = "https://api.openai.com/v1", model: str = "gpt-4o-mini"):
@@ -547,6 +610,7 @@ class OpenAIChatLLM(BaseLLM):
             logger.error(f"LLM error: {data}")
             return ""
 
+
 # -------------------------- Scoring Engine (Async) --------------------------
 class AsyncScoringEngine:
     def __init__(self, collector: AsyncDataCollector, llm: BaseLLM):
@@ -567,6 +631,13 @@ class AsyncScoringEngine:
         return min(virality, 40)
 
     async def calculate_memeability(self, session: aiohttp.ClientSession, topic: str) -> float:
+        # Check cache first
+        cache_key = f"memeability_{topic}"
+        cached = await self.collector.memeability_cache.get(cache_key)
+        if cached is not None:
+            logger.debug(f"Memeability cache hit for {topic}")
+            return cached
+
         prompt = f"Rate the memeability of the topic '{topic}' on a scale of 0-10 (0=not memey, 10=extremely viral and memeable). Return only the number."
         response = await self.llm.ask(session, prompt, timeout=5)
         try:
@@ -574,7 +645,9 @@ class AsyncScoringEngine:
             if num:
                 score = int(num.group())
                 score = max(0, min(score, 10))
-                return score * 3
+                result = score * 3
+                await self.collector.memeability_cache.set(cache_key, result)
+                return result
         except:
             pass
         return 0
@@ -608,6 +681,7 @@ class AsyncScoringEngine:
             "crypto_momentum": crypto_momentum,
             "pump_score": pump_score
         }
+
 
 # -------------------------- Telegram Bot (Async) --------------------------
 class TelegramBot:
@@ -643,7 +717,7 @@ class TelegramBot:
                 await update.message.reply_text("No trending topics found. Check API keys.")
                 return
             results = []
-            for topic in trending[:5]:
+            for topic in trending[:MAX_TOPICS]:
                 scores = await self.engine.calculate_pump_score(session, topic)
                 results.append((topic, scores["pump_score"]))
             msg = "Top trends with scores:\n"
@@ -713,7 +787,6 @@ class TelegramBot:
             await self.application.bot.send_message(chat_id=chat_id, text=f"⚠️ *ERROR*: {error_message}", parse_mode="Markdown")
 
     async def daily_summary(self, context: ContextTypes.DEFAULT_TYPE):
-        """Send daily summary of top topics from last 24 hours."""
         chat_id = DEFAULT_CHAT_ID
         if not chat_id:
             return
@@ -749,7 +822,8 @@ class TelegramBot:
                     normalized = normalize_topic(t)
                     if normalized:
                         all_topics.add(normalized)
-                all_topics = list(all_topics)[:10]
+                # Limit to MAX_TOPICS
+                all_topics = list(all_topics)[:MAX_TOPICS]
                 for topic in all_topics:
                     last_score = await get_recent_alert_score(topic)
                     scores = await self.engine.calculate_pump_score(session, topic)
@@ -783,7 +857,6 @@ class TelegramBot:
             target += timedelta(days=1)
         delta = (target - now).total_seconds()
         self.job_queue.run_once(self.daily_summary, delta)
-        # Also schedule daily recurring
         self.job_queue.run_daily(self.daily_summary, time=target.time(), days=tuple(range(7)))
 
     async def start_bot(self):
@@ -804,6 +877,7 @@ class TelegramBot:
         await self.application.stop()
         logger.info("Telegram bot stopped")
 
+
 # -------------------------- FastAPI Dashboard --------------------------
 fastapi_app = FastAPI(title="Meme Coin Trend Analyzer")
 
@@ -817,7 +891,7 @@ async def dashboard():
     <body>
         <h1>Latest Trends</h1>
         <table border="1">
-            <thead><tr><th>Topic</th><th>Pump Score</th><th>Time</th><th>Generated Name</th><th>Ticker</th></tr></thead>
+            <thead> Bonjour<th>Topic</th><th>Pump Score</th><th>Time</th><th>Generated Name</th><th>Ticker</th> </thead>
             <tbody>
     """
     for row in rows:
@@ -844,6 +918,7 @@ async def run_fastapi():
     config = uvicorn.Config(fastapi_app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
+
 
 # -------------------------- Main Entry Point --------------------------
 async def main():
@@ -893,6 +968,7 @@ async def main():
     await asyncio.gather(bot_task, api_task, return_exceptions=True)
     await bot.stop_bot()
     logger.info("Shutdown complete")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
