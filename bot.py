@@ -447,12 +447,12 @@ class AsyncDataCollector:
         await self.count_cache.set(key, count)
         return count
 
-async def get_reddit_posts(self, session: aiohttp.ClientSession, subreddits: List[str], limit: int = 10) -> List[Dict]:
+    async def get_reddit_posts(self, session: aiohttp.ClientSession, subreddits: List[str], limit: int = 10) -> List[Dict]:
     # If no Reddit credentials, skip Reddit entirely
-    if not self.reddit_client_id or not self.reddit_client_secret:
+        if not self.reddit_client_id or not self.reddit_client_secret:
         logger.info("Skipping Reddit (no OAuth credentials)")
-        return []
-    await self.reddit_rate_limiter.acquire()
+            return []
+        await self.reddit_rate_limiter.acquire()
         posts = []
         token = await self._get_reddit_oauth_token(session)
         for sub in subreddits:
